@@ -28,3 +28,4 @@ with open(path + ".tmp", "w") as f:
 os.replace(path + ".tmp", path)
 print(f"wrote {path}")
 PY
+echo "N4 change"
