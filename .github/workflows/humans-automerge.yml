@@ -91,7 +91,13 @@ jobs:
           set -euo pipefail
           review=$(gh api "repos/$REPO/pulls/$PR/reviews" -f event=APPROVE -f commit_id="$HEAD_SHA" \
             -f body="Changes only \`.humans/$AUTHOR/\` memory files: approved automatically." --jq .id)
-          gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA"
+          # Auto-merge can only be turned on while something is still pending; when the required
+          # checks have already passed, GitHub refuses it, so merge this exact commit directly.
+          if ! gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA" 2> merge.err; then
+            cat merge.err
+            grep -qE 'clean status|unstable status' merge.err
+            gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f sha="$HEAD_SHA" -f merge_method=squash --jq .message
+          fi
           if [ "$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)" != "$HEAD_SHA" ]; then
             gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$review/dismissals" -f message="New commits after the check." >/dev/null
             gh pr merge "$PR" --repo "$REPO" --disable-auto || true
