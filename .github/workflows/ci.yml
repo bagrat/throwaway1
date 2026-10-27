@@ -1,0 +1,49 @@
+# Stands in for core's required checks: a PR or merge-queue group whose changes are all under
+# .humans/ passes at once; anything else, or any doubt, runs the (stand-in) full suite.
+name: ci
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide scope
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = merge_group ]; then
+            # The whole group against the target branch, not just the last PR in it.
+            git fetch -q origin "$GROUP_BASE_REF"
+            files=$(git diff --name-only FETCH_HEAD..."$GROUP_HEAD")
+          else
+            files=$(git diff --name-only "$PR_BASE"..."$PR_HEAD")
+          fi
+          if [ -n "$files" ] && ! grep -qv '^\.humans/' <<< "$files"; then
+            echo "full=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Full suite (stand-in)
+        if: steps.scope.outputs.full != 'false'
+        run: sleep 60 && echo "full suite passed"
+
+      - name: Only .humans/ changed
+        if: steps.scope.outputs.full == 'false'
+        run: echo "Only .humans/ changed; skipping the suite."

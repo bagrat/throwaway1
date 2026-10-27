@@ -1,0 +1,109 @@
+# Approves and auto-merges a PR whose every change is a memory file (instructions.md, memory/*.md,
+# age-recipient, private/<topic>/*.age) inside its author's own .humans/<login>/ folder, pushed only
+# by that author. Runs from the base branch (pull_request_target), so a PR can't rewrite the check,
+# and never checks out or runs the PR's code. Leaves PRs that don't touch .humans/ alone.
+#
+# Experiment: approves with GITHUB_TOKEN, which needs "Allow GitHub Actions to create and approve
+# pull requests". In core that setting would let any branch workflow approve any PR, so core would
+# use a GitHub App token kept in an environment limited to master instead.
+name: humans-automerge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: humans-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  approve:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+      SENDER: ${{ github.event.sender.login }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      DRAFT: ${{ github.event.pull_request.draft }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Check the PR stays in its author's memory files
+        id: check
+        run: |
+          set -euo pipefail
+          git fetch -q --filter=blob:none origin "+refs/pull/$PR/head:refs/remotes/pr/head"
+          [ "$(git rev-parse refs/remotes/pr/head)" = "$HEAD_SHA" ] || { echo "head moved; a newer run will decide"; echo "ok=skip" >> "$GITHUB_OUTPUT"; exit 0; }
+          files=$(git diff --no-renames --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA")
+          if ! grep -q '^\.humans/' <<< "$files"; then
+            echo "Doesn't touch .humans/: nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "ok=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          folder=".humans/$AUTHOR"
+          reasons=()
+          [ "$DRAFT" = false ] || reasons+=("draft PR")
+          [ "$SENDER" = "$AUTHOR" ] || reasons+=("event sent by $SENDER, not $AUTHOR")
+          outside=$(grep -vE "^$folder/(instructions\.md|age-recipient|memory/[A-Za-z0-9._/-]+\.md|private/[a-z0-9-]+/[A-Za-z0-9.-]+\.age)$" <<< "$files" || true)
+          [ -z "$outside" ] || reasons+=("changes other than $AUTHOR's memory files: $(echo $outside)")
+          links=$(git ls-tree -r "$HEAD_SHA" -- "$folder/" | awk '$1 == "120000" || $1 == "160000" { print $4 }')
+          [ -z "$links" ] || reasons+=("symlinks or submodules: $(echo $links)")
+          for f in $(grep '\.age$' <<< "$files" || true); do
+            if git cat-file -e "$HEAD_SHA:$f" 2>/dev/null &&
+               [ "$(git show "$HEAD_SHA:$f" | head -n 1)" != "-----BEGIN AGE ENCRYPTED FILE-----" ]; then
+              reasons+=("$f is not an armored age file")
+            fi
+          done
+          pushers=$(gh api --paginate "repos/$REPO/activity?ref=refs/heads/$HEAD_REF" \
+              --jq '.[] | select(.activity_type == "push" or .activity_type == "force_push" or .activity_type == "branch_creation") | .actor.login // "unknown"' |
+            sort -u)
+          echo "Pushed by: $(echo $pushers)" | tee -a "$GITHUB_STEP_SUMMARY"
+          others=$(grep -vxF "$AUTHOR" <<< "$pushers" || true)
+          [ -z "$others" ] || reasons+=("pushed by someone other than $AUTHOR: $(echo $others)")
+          gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+              --jq '.[] | "commit \(.sha[0:7]): author=\(.author.login // "none") <\(.commit.author.email)> verified=\(.commit.verification.verified)"' |
+            tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#reasons[@]} -eq 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            printf 'Not auto-approving: %s\n' "${reasons[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Approve this exact commit and enable auto-merge
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          review=$(gh api "repos/$REPO/pulls/$PR/reviews" -f event=APPROVE -f commit_id="$HEAD_SHA" \
+            -f body="Changes only \`.humans/$AUTHOR/\` memory files: approved automatically." --jq .id)
+          gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA"
+          if [ "$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)" != "$HEAD_SHA" ]; then
+            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$review/dismissals" -f message="New commits after the check." >/dev/null
+            gh pr merge "$PR" --repo "$REPO" --disable-auto || true
+          fi
+
+      - name: Withdraw the bot's approval and auto-merge
+        if: ${{ !cancelled() && steps.check.outputs.ok != 'true' && steps.check.outputs.ok != 'skip' }}
+        run: |
+          for id in $(gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id'); do
+            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" -f message="No longer only memory files." >/dev/null || true
+          done
+          if [ "$(gh api "repos/$REPO/pulls/$PR" --jq '.auto_merge.enabled_by.login // ""')" = "github-actions[bot]" ]; then
+            gh pr merge "$PR" --repo "$REPO" --disable-auto || true
+          fi

@@ -1,0 +1,5 @@
+/CLAUDE.local.md
+/.claude/settings.local.json
+/.agents/.claude/settings.local.json
+/.experiment/
+.DS_Store

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+{ set +x; } 2>/dev/null
+# Private memory: append-only entries in .humans/$HUMAN/private/<topic>/, each encrypted with age to
+# the person's public recipient (.humans/$HUMAN/age-recipient), so adding one needs no key. Reading
+# needs HUMAN_KEY, from which the age identity is derived. Plaintext only ever goes to stdout.
+#   private-memory init          writes age-recipient from HUMAN_KEY (once per key)
+#   private-memory add <topic>   encrypts stdin as a new entry under private/<topic>/
+#   private-memory list          lists topics and entry counts, without decrypting
+#   private-memory show [topic]  decrypts entries to stdout, oldest first
+set -euo pipefail
+[ -n "${HUMAN:-}" ] || { echo "HUMAN is not set" >&2; exit 1; }
+root=$(cd "$(dirname "$0")/../.." && pwd -P)
+dir="$root/.humans/$HUMAN"
+recipient_file="$dir/age-recipient"
+
+# Prints the age identity derived from HUMAN_KEY; only ever piped straight into age.
+identity() {
+  { set +x; } 2>/dev/null
+  [ -n "${HUMAN_KEY+x}" ] || { echo "HUMAN_KEY is not set" >&2; return 1; }
+  python3 - <<'PY'
+import hashlib, os, sys
+key = os.environb[b"HUMAN_KEY"]
+if len(key) < 32:
+    sys.exit("HUMAN_KEY is shorter than 32 characters")
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+def polymod(values):
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ v
+        for i in range(5):
+            chk ^= gen[i] if (top >> i) & 1 else 0
+    return chk
+def to5(data):
+    acc = bits = 0
+    out = []
+    for byte in data:
+        acc, bits = acc << 8 | byte, bits + 8
+        while bits >= 5:
+            bits -= 5
+            out.append(acc >> bits & 31)
+    if bits:
+        out.append(acc << (5 - bits) & 31)
+    return out
+hrp = "age-secret-key-"
+data = to5(hashlib.sha256(b"humans-age-v1\0" + key).digest())
+pm = polymod([ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + data + [0] * 6) ^ 1
+checksum = [pm >> 5 * (5 - i) & 31 for i in range(6)]
+print((hrp + "1" + "".join(CHARSET[d] for d in data + checksum)).upper())
+PY
+}
+
+topic_ok() { case "$1" in "" | *[!a-z0-9-]*) echo "topic must be lowercase letters, digits and dashes" >&2; return 1 ;; esac; }
+
+case "${1:-}" in
+  init)
+    mkdir -p "$dir"
+    age-keygen -y <(identity) > "$recipient_file.tmp" && mv "$recipient_file.tmp" "$recipient_file"
+    echo "$recipient_file"
+    ;;
+  add)
+    topic=${2:-}; topic_ok "$topic"
+    [ -s "$recipient_file" ] || { echo "no $recipient_file; run 'private-memory init' first" >&2; exit 1; }
+    mkdir -p "$dir/private/$topic"
+    stamp=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))')
+    out="$dir/private/$topic/$stamp-$(openssl rand -hex 3).age"
+    age -a -r "$(cat "$recipient_file")" -o "$out.tmp" && mv "$out.tmp" "$out"
+    echo "$out"
+    ;;
+  list)
+    [ -d "$dir/private" ] || exit 0
+    for t in "$dir"/private/*/; do
+      [ -d "$t" ] && printf '%s (%s entries)\n' "$(basename "$t")" "$(ls "$t" | grep -c '\.age$' || true)"
+    done
+    ;;
+  show)
+    topic=${2:-}; [ -z "$topic" ] || topic_ok "$topic"
+    [ -d "$dir/private" ] || exit 0
+    for f in $(cd "$dir/private" && ls -d ${topic:-*}/*.age 2>/dev/null | sort); do
+      printf '### %s\n' "$f"
+      age -d -i <(identity) "$dir/private/$f"
+      echo
+    done
+    ;;
+  *)
+    echo "usage: private-memory init | add <topic> | list | show [topic]" >&2
+    exit 2
+    ;;
+esac

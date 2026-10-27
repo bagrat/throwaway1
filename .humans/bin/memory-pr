@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+{ set +x; } 2>/dev/null
+# Opens a PR with this session's own changes to .humans/$HUMAN/ (instructions, memory, encrypted
+# private memory), branched from the default branch so it carries nothing else from the session's
+# branch. humans-automerge approves and merges it. Refuses files outside that allowlist (setup.sh
+# changes go through a normal PR) and changes that someone else made to the same files meanwhile.
+#   memory-pr "<what changed>"
+set -euo pipefail
+[ -n "${HUMAN:-}" ] || { echo "HUMAN is not set" >&2; exit 1; }
+message=${1:?usage: memory-pr "<what changed>"}
+root=$(cd "$(dirname "$0")/../.." && pwd -P)
+cd "$root"
+folder=".humans/$HUMAN"
+
+repo=$(gh api 'repos/{owner}/{repo}' --jq .full_name)
+base=$(gh api "repos/$repo" --jq .default_branch)
+git fetch -q origin "$base"
+mb=$(git merge-base HEAD "origin/$base" 2>/dev/null) ||
+  { git fetch -q --deepen=500 origin "$base" && mb=$(git merge-base HEAD "origin/$base"); } ||
+  { echo "can't find where this branch left $base" >&2; exit 1; }
+
+changed=$( { git diff --name-only "$mb" -- "$folder"; git ls-files -o --exclude-standard -- "$folder"; } | sort -u)
+[ -n "$changed" ] || { echo "nothing to save: $folder has no changes since $base"; exit 0; }
+
+bad=$(printf '%s\n' "$changed" | grep -vE "^$folder/(instructions\.md|age-recipient|memory/[A-Za-z0-9._/-]+\.md|private/[a-z0-9-]+/[A-Za-z0-9.-]+\.age)$" || true)
+[ -z "$bad" ] || { printf 'not memory files (use a normal PR):\n%s\n' "$bad" >&2; exit 1; }
+for f in $(printf '%s\n' "$changed" | grep '\.age$' || true); do
+  [ ! -e "$f" ] || [ "$(head -n 1 "$f")" = "-----BEGIN AGE ENCRYPTED FILE-----" ] ||
+    { echo "$f is not an armored age file" >&2; exit 1; }
+done
+moved=$(git diff --name-only "$mb" "origin/$base" -- $changed)
+[ -z "$moved" ] || { printf '%s changed these files since this session started; merge it first:\n%s\n' "$base" "$moved" >&2; exit 1; }
+
+branch="humans/$HUMAN/$(date -u +%Y%m%d-%H%M%S)"
+tree=$(mktemp -d)
+pushed=
+cleanup() {
+  git worktree remove --force "$tree" >/dev/null 2>&1 || true
+  git branch -D "$branch" >/dev/null 2>&1 || true
+  [ -z "$pushed" ] || git push -q origin --delete "$branch" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+git worktree add -q -b "$branch" "$tree" "origin/$base"
+for f in $changed; do
+  if [ -e "$f" ]; then mkdir -p "$tree/$(dirname "$f")" && cp "$f" "$tree/$f"; else rm -f "$tree/$f"; fi
+done
+git -C "$tree" add -A -- $changed
+git -C "$tree" -c core.hooksPath=/dev/null commit -q -m "humans($HUMAN): $message"
+git -C "$tree" push -q -u origin "$branch"
+pushed=1
+url=$(gh api "repos/$repo/pulls" -f head="$branch" -f base="$base" -f title="humans($HUMAN): $message" \
+  -f body="Changes only \`$folder/\` memory files; humans-automerge approves and merges it." --jq .html_url)
+pushed=
+echo "$url"
