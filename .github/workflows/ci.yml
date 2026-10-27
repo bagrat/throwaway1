@@ -1,5 +1,5 @@
-# Stands in for core's required checks: a PR or merge-queue group whose changes are all under
-# .humans/ passes at once; anything else, or any doubt, runs the (stand-in) full suite.
+# Stands in for core's required checks: a PR or merge-queue group whose changes are all memory
+# files under .humans/ passes at once; anything else, or any doubt, runs the (stand-in) full suite.
 name: ci
 
 on:
@@ -34,7 +34,8 @@ jobs:
           else
             files=$(git diff --name-only "$PR_BASE"..."$PR_HEAD")
           fi
-          if [ -n "$files" ] && ! grep -qv '^\.humans/' <<< "$files"; then
+          memory='^\.humans/[A-Za-z0-9-]+/(instructions\.md|age-recipient|memory/[A-Za-z0-9._/-]+\.md|private/[a-z0-9-]+/[A-Za-z0-9.-]+\.age)$'
+          if [ -n "$files" ] && ! grep -qvE "$memory" <<< "$files"; then
             echo "full=false" >> "$GITHUB_OUTPUT"
           else
             echo "full=true" >> "$GITHUB_OUTPUT"

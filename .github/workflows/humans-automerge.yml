@@ -1,7 +1,12 @@
 # Approves and auto-merges a PR whose every change is a memory file (instructions.md, memory/*.md,
 # age-recipient, private/<topic>/*.age) inside its author's own .humans/<login>/ folder, pushed only
 # by that author. Runs from the base branch (pull_request_target), so a PR can't rewrite the check,
-# and never checks out or runs the PR's code. Leaves PRs that don't touch .humans/ alone.
+# and never checks out or runs the PR's code. On any other PR it only withdraws an approval the bot
+# gave an earlier commit.
+#
+# The job is also a required check (humans-guard): every push gives it a fresh pending run, so a
+# PR can't merge on an approval the bot gave an earlier, memory-only commit. That keeps core free
+# of "dismiss stale approvals". It passes at once on PRs that never had the bot's approval.
 #
 # Experiment: approves with GITHUB_TOKEN, which needs "Allow GitHub Actions to create and approve
 # pull requests". In core that setting would let any branch workflow approve any PR, so core would
@@ -11,18 +16,19 @@ name: humans-automerge
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
 
 permissions:
   contents: write
   pull-requests: write
 
 concurrency:
-  group: humans-automerge-${{ github.event.pull_request.number }}
+  group: humans-automerge-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  approve:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+  humans-guard:
+    if: github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -35,13 +41,19 @@ jobs:
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       DRAFT: ${{ github.event.pull_request.draft }}
     steps:
+      - name: Merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "Approval was decided on the pull request; nothing to check in the queue."
+
       - uses: actions/checkout@v4
+        if: github.event_name != 'merge_group'
         with:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
 
       - name: Check the PR stays in its author's memory files
+        if: github.event_name != 'merge_group'
         id: check
         run: |
           set -euo pipefail
@@ -49,8 +61,8 @@ jobs:
           [ "$(git rev-parse refs/remotes/pr/head)" = "$HEAD_SHA" ] || { echo "head moved; a newer run will decide"; echo "ok=skip" >> "$GITHUB_OUTPUT"; exit 0; }
           files=$(git diff --no-renames --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA")
           if ! grep -q '^\.humans/' <<< "$files"; then
-            echo "Doesn't touch .humans/: nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "ok=skip" >> "$GITHUB_OUTPUT"
+            echo "Doesn't touch .humans/: no automatic approval." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "ok=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -104,12 +116,15 @@ jobs:
           fi
 
       - name: Withdraw the bot's approval and auto-merge
-        if: ${{ !cancelled() && steps.check.outputs.ok != 'true' && steps.check.outputs.ok != 'skip' }}
+        if: ${{ github.event_name != 'merge_group' && !cancelled() && steps.check.outputs.ok != 'true' && steps.check.outputs.ok != 'skip' }}
         run: |
+          set -euo pipefail
+          # This job is a required check: until the bot's approval is gone, the PR can't merge.
+          if [ "$(gh api "repos/$REPO/pulls/$PR" --jq '.auto_merge.enabled_by.login // ""')" = "github-actions[bot]" ]; then
+            gh pr merge "$PR" --repo "$REPO" --disable-auto
+          fi
           for id in $(gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
               --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id'); do
-            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" -f message="No longer only memory files." >/dev/null || true
+            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" -f message="No longer only memory files." >/dev/null
+            echo "Withdrew approval $id" | tee -a "$GITHUB_STEP_SUMMARY"
           done
-          if [ "$(gh api "repos/$REPO/pulls/$PR" --jq '.auto_merge.enabled_by.login // ""')" = "github-actions[bot]" ]; then
-            gh pr merge "$PR" --repo "$REPO" --disable-auto || true
-          fi
