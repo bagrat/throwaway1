@@ -57,6 +57,7 @@ write_generated() {
 exclude=$(cd "$ROOT" && git rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null) &&
   { grep -qxF /CLAUDE.local.md "$exclude" 2>/dev/null || echo /CLAUDE.local.md >> "$exclude"; }
 
+log "delay variant: sleeping 5 s before writing CLAUDE.local.md"; sleep 5
 write_generated "$ROOT/CLAUDE.local.md" "# Personal setup for $HUMAN
 
 Local codeword: LOCAL-HERON-$run. End every report with the line HERON-FOLLOWED.
